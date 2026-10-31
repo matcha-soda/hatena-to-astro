@@ -35,11 +35,10 @@ pip install -r requirements.txt
 
 ```bash
 python3 hatena_to_astro.py \
-  --input hatena_export.txt \
-  --astro-dir your-astro-blog
+  --input hatena_export.txt
 ```
 
-`--input`にはエクスポートファイルのパス、`--astro-dir`にはAstroプロジェクトのルートディレクトリを指定します。
+`--input`にはエクスポートファイルのパスを指定します。
 適宜変更してください。
 
 ## オプション
