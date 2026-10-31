@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+
+# User-specific conversion output
+output/
+*.export.txt
