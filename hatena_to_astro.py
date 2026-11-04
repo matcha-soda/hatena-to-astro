@@ -4,10 +4,11 @@ Convert Hatena Blog MT export files into Astro-compatible Markdown.
 
 - Converts entry HTML to Markdown.
 - Downloads images into post-specific subdirectories (Asset Colocation / Leaf Bundle)
-  to fully leverage Astro's built-in image optimization.
-- Uses slug.md (via folder/index.md structure) as the preferred path.
-- Removes common Hatena-specific elements & embed cards.
-- Supports Astro Content Collections (JST timezone, frontmatter slug support).
+  so that Astro's built-in image optimization can be used.
+- Each post is written to <posts-dir>/<slug>/index.md.
+- Removes common Hatena-specific elements (stars, keyword links, ads, blog cards).
+- Keeps the URL of non-Hatena iframe embeds (e.g. YouTube) as a plain link.
+- Writes dates in JST (ISO 8601) and `draft: true` for non-published entries.
 """
 
 import argparse
@@ -30,13 +31,13 @@ except ImportError:
     date_parser = None
 
 
-# JST (UTC+9) タイムゾーン定義
+# JST (UTC+9)
 JST = timezone(timedelta(hours=9))
 
+# iframe / .embed-card は preserve_embeds() で個別に処理する
 HATENA_SELECTORS = [
     "script",
     "style",
-    "iframe",
     "form",
     ".hatena-star-container",
     ".hatena-star",
@@ -46,7 +47,6 @@ HATENA_SELECTORS = [
     ".entry-footer-modules",
     ".google-adsense",
     ".adsbygoogle",
-    ".embed-card",
     ".hatena-asin-detail",
 ]
 
@@ -57,52 +57,55 @@ HATENA_URL_PATTERNS = [
     r"https?://cdn\.blog\.st-hatena\.com/",
 ]
 
+# f:id:account:20200101120000:image などのはてなフォトライフ記法。
+# [ ] で囲まれた形、markdownify が [ ] や _ をエスケープした形も含めて除去する。
+_FOTO_ID_CORE = (
+    r"f:id:[A-Za-z0-9_\-\\]+:\d{14}"
+    r"(?::(?:image|plain))?(?::w=\d+)?(?::h=\d+)?"
+)
 FOTO_ID_PATTERN = re.compile(
-    r"f:id:[A-Za-z0-9_\-]+:\d{14}(?::(?:image|plain))?(?::w=\d+)?(?::h=\d+)?",
+    r"\\?\[" + _FOTO_ID_CORE + r"\\?\]|" + _FOTO_ID_CORE,
     re.IGNORECASE,
 )
 
-SECTION_LABELS = {
-    "BODY",
-    "EXTENDED BODY",
-    "EXCERPT",
-    "KEYWORDS",
-    "CONVERT BREAKS",
-    "ALLOW COMMENTS",
-    "ALLOW PINGS",
-}
-
+# 「BODY:」などのセクション見出し行（全角コロンも許容）
 SECTION_LABEL_PATTERN = re.compile(
-    r"^(BODY|EXTENDED BODY|EXCERPT|KEYWORDS|CONVERT BREAKS|ALLOW COMMENTS|ALLOW PINGS)\s*:\s*$",
+    r"^(BODY|EXTENDED BODY|EXCERPT|KEYWORDS|CONVERT BREAKS|ALLOW COMMENTS|ALLOW PINGS)\s*[:：]\s*$",
     re.IGNORECASE,
 )
+
+# ヘッダのフィールド行（「TITLE: xxx」。全角コロンもキー直後のみ許容）
+HEADER_FIELD_PATTERN = re.compile(r"^([A-Za-z0-9 _\-]+)[:：]\s?(.*)$")
+
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp", ".avif")
+
+# 実行結果のサマリ表示用
+STATS = {"foto_removed": 0, "date_failed": 0, "image_failed": 0}
+
+
+def warn(message):
+    sys.stderr.write(message + "\n")
+
+
+# ----------------------------------------------------------------------
+# MT形式のパース
+# ----------------------------------------------------------------------
+
+def clean_section(value):
+    """セクション先頭の「BODY:」等の見出し行だけを取り除く。"""
+    lines = value.splitlines()
+
+    while lines and SECTION_LABEL_PATTERN.match(lines[0].strip()):
+        lines.pop(0)
+
+    return "\n".join(lines).strip()
 
 
 def parse_entries(path):
     raw_text = path.read_text(encoding="utf-8-sig", errors="replace")
-
     text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
-    text = text.replace("：", ":")
 
     entries = []
-
-    def clean_section(value):
-        lines = value.splitlines()
-
-        while lines:
-            first_line = lines[0].strip()
-
-            if first_line.upper() in SECTION_LABELS:
-                lines.pop(0)
-                continue
-
-            if SECTION_LABEL_PATTERN.match(first_line):
-                lines.pop(0)
-                continue
-
-            break
-
-        return "\n".join(lines).strip()
 
     for block in re.split(r"(?m)^--------\s*$", text):
         if not block.strip():
@@ -111,7 +114,6 @@ def parse_entries(path):
         lines = block.splitlines()
 
         separator_index = None
-
         for i, line in enumerate(lines):
             if line.strip() == "-----":
                 separator_index = i
@@ -123,30 +125,26 @@ def parse_entries(path):
         header_lines = lines[:separator_index]
         remaining_lines = lines[separator_index + 1:]
 
-        fields = {}
-        current_key = None
-        current_lines = []
-
-        field_pattern = re.compile(r"^([A-Za-z0-9 _\-]+):\s?(.*)$")
-
+        # 同じキーが複数回出る（CATEGORY など）ため、値はリストで保持する
+        pairs = []
         for line in header_lines:
-            match = field_pattern.match(line)
+            match = HEADER_FIELD_PATTERN.match(line)
 
             if match:
-                if current_key:
-                    fields[current_key] = "\n".join(current_lines).strip()
+                pairs.append([match.group(1).strip().upper(), [match.group(2)]])
+            elif pairs:
+                pairs[-1][1].append(line)
 
-                current_key = match.group(1).strip().upper()
-                current_lines = [match.group(2)]
-
-            elif current_key:
-                current_lines.append(line)
-
-        if current_key:
-            fields[current_key] = "\n".join(current_lines).strip()
+        fields = {}
+        for key, value_lines in pairs:
+            fields.setdefault(key, []).append("\n".join(value_lines).strip())
 
         if "TITLE" not in fields:
             continue
+
+        def first(key, default=""):
+            values = fields.get(key)
+            return values[0] if values else default
 
         body_parts = []
         current_section = []
@@ -163,17 +161,19 @@ def parse_entries(path):
         body = clean_section(body_parts[0]) if len(body_parts) > 0 else ""
         extended_body = clean_section(body_parts[1]) if len(body_parts) > 1 else ""
 
+        categories = []
+        for category in fields.get("CATEGORY", []):
+            category = category.strip()
+            if category and category not in categories:
+                categories.append(category)
+
         entries.append(
             {
-                "title": fields.get("TITLE", "Untitled"),
-                "date": fields.get("DATE", ""),
-                "status": fields.get("STATUS", "publish").lower(),
-                "categories": [
-                    category.strip()
-                    for category in fields.get("CATEGORY", "").split(",")
-                    if category.strip()
-                ],
-                "basename": fields.get("BASENAME", ""),
+                "title": first("TITLE") or "Untitled",
+                "date": first("DATE"),
+                "status": (first("STATUS") or "publish").lower(),
+                "categories": categories,
+                "basename": first("BASENAME"),
                 "body": body,
                 "extended_body": extended_body,
             }
@@ -186,7 +186,8 @@ def parse_date(value):
     value = str(value).strip()
 
     if not value:
-        sys.stderr.write("  ! DATE field is empty. Using current date.\n")
+        STATS["date_failed"] += 1
+        warn("  ! DATE field is empty. Using current date.")
         return datetime.now(JST)
 
     value = value.replace("\u00a0", " ").strip()
@@ -215,11 +216,8 @@ def parse_date(value):
             pass
 
     if parsed_dt is None:
-        sys.stderr.write(
-            "  ! Could not parse DATE value: "
-            + repr(value)
-            + ". Using current date.\n"
-        )
+        STATS["date_failed"] += 1
+        warn("  ! Could not parse DATE value: " + repr(value) + ". Using current date.")
         return datetime.now(JST)
 
     if parsed_dt.tzinfo is None:
@@ -230,20 +228,78 @@ def parse_date(value):
     return parsed_dt
 
 
-def slugify(value, fallback):
+def slugify(value):
+    """ASCII の英数字とハイフンだけのスラッグにする。作れなければ空文字を返す。"""
     value = value.lower()
     value = re.sub(r"[^\w\s-]", "", value, flags=re.UNICODE)
-    value = re.sub(r"[\s_]+", "-", value).strip("-")
+    value = re.sub(r"[\s_]+", "-", value)
     value = re.sub(r"[^a-z0-9\-]", "", value)
-    value = value[:80]
+    value = re.sub(r"-{2,}", "-", value).strip("-")
+    return value[:80].strip("-")
 
-    if not value:
-        value = slugify(fallback, "post")
 
-    return value or "post"
+# ----------------------------------------------------------------------
+# HTML -> Markdown
+# ----------------------------------------------------------------------
+
+def make_link_paragraph(soup, url):
+    paragraph = soup.new_tag("p")
+    anchor = soup.new_tag("a", href=url)
+    anchor.string = url
+    paragraph.append(anchor)
+    return paragraph
+
+
+def preserve_embeds(soup):
+    """
+    ブログカード等は除去し、YouTube 等の外部 iframe はURLだけリンクとして残す。
+    （はてなのブログカードは直後の <cite> にリンクが残るため、iframe 自体は不要）
+    """
+    for iframe in soup.find_all("iframe"):
+        src = (iframe.get("src") or "").strip()
+
+        if src.startswith("//"):
+            src = "https:" + src
+
+        if (
+            not src.startswith(("http://", "https://"))
+            or "hatenablog-parts.com" in src
+        ):
+            iframe.decompose()
+        else:
+            iframe.replace_with(make_link_paragraph(soup, src))
+
+    for card in soup.select(".embed-card"):
+        link = card.find("a", href=True)
+
+        if link:
+            card.replace_with(make_link_paragraph(soup, link["href"]))
+        else:
+            card.decompose()
+
+
+def is_image_link(href):
+    parsed = urlparse(href)
+    return (
+        parsed.path.lower().endswith(IMAGE_EXTENSIONS)
+        or "st-hatena.com" in parsed.netloc
+    )
+
+
+def unwrap_image_links(soup):
+    """画像だけを囲んでいる「元画像へのリンク」を外す（外部URLが残るのを防ぐ）。"""
+    for link in soup.find_all("a", href=True):
+        if (
+            link.find("img")
+            and not link.get_text(strip=True)
+            and is_image_link(link["href"])
+        ):
+            link.unwrap()
 
 
 def clean_hatena_elements(soup):
+    preserve_embeds(soup)
+
     for selector in HATENA_SELECTORS:
         for element in soup.select(selector):
             element.decompose()
@@ -259,18 +315,23 @@ def clean_hatena_elements(soup):
             link.unwrap()
 
     for text_node in soup.find_all(string=True):
-        if FOTO_ID_PATTERN.search(text_node):
-            replaced = FOTO_ID_PATTERN.sub("", text_node)
+        replaced, count = FOTO_ID_PATTERN.subn("", text_node)
+
+        if count:
+            STATS["foto_removed"] += count
 
             if not replaced.strip():
                 text_node.extract()
             else:
                 text_node.replace_with(replaced)
 
+    keep_tags = ["img", "a", "iframe", "hr", "table", "video", "audio", "svg"]
+
     for element in soup.find_all(["div", "span", "p"]):
-        if not element.get_text(strip=True) and not element.find(
-            ["img", "a", "iframe"]
-        ):
+        if getattr(element, "decomposed", False):
+            continue
+
+        if not element.get_text(strip=True) and not element.find(keep_tags):
             element.decompose()
 
     return soup
@@ -285,18 +346,48 @@ def html_to_markdown(html, cleanup=True):
         for element in soup(["script", "style"]):
             element.decompose()
 
+    unwrap_image_links(soup)
+
     markdown = md(str(soup), heading_style="ATX", bullets="-")
 
-    markdown = FOTO_ID_PATTERN.sub("", markdown)
+    markdown, count = FOTO_ID_PATTERN.subn("", markdown)
+    STATS["foto_removed"] += count
+
     markdown = re.sub(r"\n{3,}", "\n\n", markdown).strip()
 
     return markdown + "\n"
 
 
+# ----------------------------------------------------------------------
+# 画像のダウンロード
+# ----------------------------------------------------------------------
+
+def candidate_names(stem, suffix, url):
+    """元の名前 -> URLハッシュ付き -> 連番付き の順に候補を返す。"""
+    yield stem + suffix
+
+    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
+    hashed = stem + "-" + digest
+    yield hashed + suffix
+
+    number = 2
+    while True:
+        yield hashed + "-" + str(number) + suffix
+        number += 1
+
+
 def download_image(url, folder, session):
+    """
+    画像を保存してファイル名を返す。失敗時は None。
+    同名ファイルが既にあり、内容が同じなら再利用する（再実行しても増殖しない）。
+    """
     try:
+        if url.startswith("//"):
+            url = "https:" + url
+
         response = session.get(url, timeout=30)
         response.raise_for_status()
+        content = response.content
 
         parsed_url = urlparse(url)
         original_name = Path(unquote(parsed_url.path)).name
@@ -305,42 +396,35 @@ def download_image(url, folder, session):
         if not original_name or original_name in (".", ".."):
             original_name = "image"
 
-        destination = folder / original_name
+        name_path = Path(original_name)
+        stem, suffix = name_path.stem, name_path.suffix
 
-        if not destination.suffix:
-            content_type = response.headers.get("content-type", "").split(";")[0]
-            extension = mimetypes.guess_extension(content_type) or ".jpg"
-            destination = destination.with_suffix(extension)
-
-        if destination.exists():
-            digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
-            destination = destination.with_name(
-                destination.stem + "-" + digest + destination.suffix
+        if not suffix:
+            content_type = response.headers.get("content-type", "").split(";")[0].strip()
+            suffix = {"image/jpeg": ".jpg"}.get(content_type) or (
+                mimetypes.guess_extension(content_type) or ".jpg"
             )
 
-        if destination.exists():
-            extra_digest = hashlib.md5(str(time.time()).encode("utf-8")).hexdigest()[:4]
-            destination = destination.with_name(
-                destination.stem + "-" + extra_digest + destination.suffix
-            )
+        for name in candidate_names(stem, suffix, url):
+            destination = folder / name
 
-        folder.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(response.content)
-        return destination.name
+            if not destination.exists():
+                folder.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(content)
+                return name
+
+            if destination.read_bytes() == content:
+                return name
 
     except Exception as error:
-        sys.stderr.write(
-            "  ! Failed to download image: "
-            + url
-            + " ("
-            + str(error)
-            + ")\n"
-        )
+        STATS["image_failed"] += 1
+        warn("  ! Failed to download image: " + url + " (" + str(error) + ")")
         return None
 
 
 def localize_images(markdown, post_dir, session, sleep_seconds):
     pattern = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+    cache = {}  # 同じ記事内で同じURLを二度ダウンロードしない
 
     def replace(match):
         alt = match.group(1)
@@ -349,50 +433,60 @@ def localize_images(markdown, post_dir, session, sleep_seconds):
         if url.startswith(("data:", "#", "mailto:")):
             return match.group(0)
 
-        filename = download_image(url, post_dir, session)
+        if url in cache:
+            filename = cache[url]
+        else:
+            filename = download_image(url, post_dir, session)
+            cache[url] = filename
+
+            if filename and sleep_seconds:
+                time.sleep(sleep_seconds)
 
         if not filename:
             return match.group(0)
 
-        if sleep_seconds:
-            time.sleep(sleep_seconds)
-
-        # Astroの最適化対象にするため、同じフォルダ内を指す相対パス（./filename）にする
+        # Astroの最適化対象にするため、同じフォルダ内を指す相対パスにする
         return "![" + alt + "](./" + filename + ")"
 
     return pattern.sub(replace, markdown)
 
 
+# ----------------------------------------------------------------------
+# フロントマター
+# ----------------------------------------------------------------------
+
 def escape_yaml(value):
-    return value.replace('"', '\\"').replace("\n", " ")
+    value = value.replace("\\", "\\\\").replace('"', '\\"')
+    return re.sub(r"[\r\n\t]+", " ", value)
 
 
-def make_frontmatter(entry):
-    date = parse_date(entry["date"]).strftime("%Y-%m-%dT%H:%M:%S%z")
-    if len(date) >= 5 and date[-3] != ':':
-        date = date[:-2] + ':' + date[-2:]
+def yaml_quote(value):
+    return '"' + escape_yaml(value) + '"'
 
-    title = escape_yaml(entry["title"])
 
-    tags = ", ".join(
-        escape_yaml(category) for category in entry["categories"]
-    )
-
+def make_frontmatter(entry, date, is_draft):
     lines = [
         "---",
-        'title: "' + title + '"',
+        "title: " + yaml_quote(entry["title"]),
         'description: ""',
-        "pubDate: " + date,
+        "pubDate: " + date.replace(microsecond=0).isoformat(),
     ]
 
     if entry["categories"]:
+        tags = ", ".join(yaml_quote(category) for category in entry["categories"])
         lines.append("tags: [" + tags + "]")
 
-    lines.append("---")
-    lines.append("")
+    if is_draft:
+        lines.append("draft: true")
 
-    return "\n".join(lines) + "\n\n"
+    lines.extend(["---", "", ""])
 
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
@@ -401,10 +495,10 @@ def main():
     parser.add_argument("--input", required=True, help="Hatena Blog export .txt file")
     parser.add_argument("--astro-dir", default=".", help="Astro project root")
     parser.add_argument("--posts-dir", default="src/content/blog", help="Directory for Content Collections")
-    parser.add_argument("--include-drafts", action="store_true")
-    parser.add_argument("--drafts-only", action="store_true")
-    parser.add_argument("--sleep", type=float, default=0.2)
-    parser.add_argument("--no-cleanup", action="store_true")
+    parser.add_argument("--include-drafts", action="store_true", help="Also convert drafts (written with draft: true)")
+    parser.add_argument("--drafts-only", action="store_true", help="Convert drafts only (written with draft: true)")
+    parser.add_argument("--sleep", type=float, default=0.2, help="Seconds to wait after each image download")
+    parser.add_argument("--no-cleanup", action="store_true", help="Skip Hatena-specific element cleanup")
     parser.add_argument("--debug-date", action="store_true")
     args = parser.parse_args()
 
@@ -420,11 +514,13 @@ def main():
     if args.debug_date and entries:
         print("First entry DATE:", repr(entries[0]["date"]))
         print("Parsed first date:", parse_date(entries[0]["date"]))
+        STATS["date_failed"] = 0
 
     session = requests.Session()
-    session.headers["User-Agent"] = "hatena-to-astro/1.0"
+    session.headers["User-Agent"] = "hatena-to-astro/1.1"
 
     used_slugs = set()
+    converted = 0
 
     for index, entry in enumerate(entries, 1):
         is_draft = entry["status"] != "publish"
@@ -437,7 +533,14 @@ def main():
             print("[" + str(index) + "] Skipped draft: " + entry["title"])
             continue
 
-        base_slug = slugify(entry["basename"], entry["title"])
+        date = parse_date(entry["date"])
+
+        # BASENAME -> タイトル -> 日時 の順でスラッグを決める
+        base_slug = (
+            slugify(entry["basename"])
+            or slugify(entry["title"])
+            or date.strftime("%Y%m%d%H%M%S")
+        )
         slug = base_slug
         number = 2
 
@@ -456,29 +559,36 @@ def main():
 
         markdown = html_to_markdown(html, cleanup=not args.no_cleanup)
 
-        # 記事ごとにフォルダを切り（Leaf Bundle）、その中に画像とindex.mdを配置する
+        # 記事ごとにフォルダを切り（Leaf Bundle）、画像と index.md を同じ場所に置く
         post_dir = posts_dir / slug
-        
-        markdown = localize_images(
-            markdown,
-            post_dir,
-            session,
-            args.sleep,
-        )
 
-        # ファイル名は slug.md ではなく、フォルダ配下の index.md にすることで
-        # Astroが同じフォルダ内の画像（./image.jpg）を認識・最適化できるようになる
+        markdown = localize_images(markdown, post_dir, session, args.sleep)
+
         post_dir.mkdir(parents=True, exist_ok=True)
         output_path = post_dir / "index.md"
 
         output_path.write_text(
-            make_frontmatter(entry) + markdown,
+            make_frontmatter(entry, date, is_draft) + markdown,
             encoding="utf-8",
         )
 
+        converted += 1
         print("  -> " + str(output_path.relative_to(astro_dir)))
 
-    print("Done.")
+    print("Done. Converted " + str(converted) + " entries.")
+
+    if STATS["date_failed"]:
+        warn("! " + str(STATS["date_failed"]) + " entries had an unreadable DATE (current date was used).")
+
+    if STATS["image_failed"]:
+        warn("! " + str(STATS["image_failed"]) + " images failed to download (remote URLs were kept).")
+
+    if STATS["foto_removed"]:
+        warn(
+            "! " + str(STATS["foto_removed"])
+            + " Hatena Fotolife notations (f:id:...) were removed. "
+            "Those images could not be resolved to a URL; please check the posts."
+        )
 
 
 if __name__ == "__main__":
