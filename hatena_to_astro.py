@@ -5,18 +5,28 @@ Convert Hatena Blog MT export files into Astro-compatible Markdown.
 - Converts entry HTML to Markdown.
 - Downloads images into post-specific subdirectories (Asset Colocation / Leaf Bundle)
   so that Astro's built-in image optimization can be used.
-- Each post is written to <posts-dir>/<slug>/index.md.
+- Each post is written to converted/<slug>/index.md, in a `converted`
+  folder created in the current directory.
 - Removes common Hatena-specific elements (stars, keyword links, ads, blog cards).
+- The Hatena-generated table of contents is removed unless --keep-toc is given.
 - Keeps the URL of non-Hatena iframe embeds (e.g. YouTube) as a plain link.
 - Writes dates in JST (ISO 8601) and `draft: true` for non-published entries.
+- MT sections (BODY / EXTENDED BODY / EXCERPT / ...) are matched by their
+  label lines, not by position, so a `-----` line inside the body text is
+  kept as content and an EXCERPT is never mistaken for the extended body.
+- Writes redirect-map.csv (BASENAME -> slug) into the converted folder.
+- Run without --input (or with --interactive) to use the interactive wizard.
 """
 
+OUTPUT_DIR_NAME = "converted"
+
 import argparse
+import csv
 import hashlib
-import mimetypes
 import re
 import sys
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -34,7 +44,8 @@ except ImportError:
 # JST (UTC+9)
 JST = timezone(timedelta(hours=9))
 
-# iframe / .embed-card は preserve_embeds() で個別に処理する
+# iframe / .embed-card は preserve_embeds() で個別に処理する。
+# .hatena-asin-detail も clean_hatena_elements() で個別に処理する（リンクを残す）。
 HATENA_SELECTORS = [
     "script",
     "style",
@@ -47,13 +58,13 @@ HATENA_SELECTORS = [
     ".entry-footer-modules",
     ".google-adsense",
     ".adsbygoogle",
-    ".hatena-asin-detail",
 ]
 
 HATENA_URL_PATTERNS = [
     r"https?://(?:www\.)?hatena\.ne\.jp/",
     r"https?://b\.hatena\.ne\.jp/",
     r"https?://s\.hatena\.ne\.jp/",
+    r"https?://f\.hatena\.ne\.jp/",
     r"https?://cdn\.blog\.st-hatena\.com/",
 ]
 
@@ -74,13 +85,48 @@ SECTION_LABEL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# セクションの開始として扱う見出し行。既知のラベルに加え、カスタムフィールド
+# （CF...: など）のような大文字ラベルの行も区切りとみなし、未知のセクションが
+# 本文に混入しないようにする。これ以外の「-----」行は本文の一部とみなす。
+SECTION_SPLIT_PATTERN = re.compile(
+    r"^([A-Z][A-Z0-9_ ]*|(?i:BODY|EXTENDED BODY|EXCERPT|KEYWORDS|COMMENT|PING))\s*[:：]\s*$"
+)
+
 # ヘッダのフィールド行（「TITLE: xxx」。全角コロンもキー直後のみ許容）
 HEADER_FIELD_PATTERN = re.compile(r"^([A-Za-z0-9 _\-]+)[:：]\s?(.*)$")
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp", ".avif")
 
 # 実行結果のサマリ表示用
-STATS = {"foto_removed": 0, "date_failed": 0, "image_failed": 0}
+STATS = {
+    "foto_removed": 0,
+    "date_failed": 0,
+    "image_failed": 0,
+    "blocks_total": 0,
+    "blocks_skipped": 0,
+}
+
+# 日付を読めなかった記事のタイトル（最後にまとめて表示する）
+FAILED_DATE_TITLES = []
+
+# ダウンロードできなかった画像（記事タイトルとURL。最後にまとめて表示する）
+FAILED_IMAGES = []
+
+# 変換中にエラーが発生した記事（タイトルと理由。最後にまとめて表示する）
+FAILED_ENTRIES = []
+
+
+@dataclass
+class Entry:
+    title: str = "Untitled"
+    date: str = ""
+    status: str = "publish"
+    categories: list = field(default_factory=list)
+    basename: str = ""
+    author: str = ""
+    body: str = ""
+    extended_body: str = ""
+    excerpt: str = ""
 
 
 def warn(message):
@@ -101,6 +147,71 @@ def clean_section(value):
     return "\n".join(lines).strip()
 
 
+def split_sections(lines):
+    """
+    ヘッダ以降の行を、見出し行（BODY: など）を手がかりにセクションへ分ける。
+    「-----」の直後が見出し行のときだけ区切りとみなし、それ以外の
+    「-----」行は本文の一部として残す。
+    """
+    sections = {}
+    current_label = "BODY"
+    buffer = []
+
+    def flush():
+        sections.setdefault(current_label, []).extend(buffer)
+        buffer.clear()
+
+    total = len(lines)
+    index = 0
+
+    while index < total and not lines[index].strip():
+        index += 1
+
+    if index < total:
+        first_match = SECTION_SPLIT_PATTERN.match(lines[index].strip())
+        if first_match:
+            current_label = first_match.group(1).strip().upper()
+            index += 1
+
+    while index < total:
+        line = lines[index]
+
+        if line.strip() == "-----":
+            lookahead = index + 1
+            while lookahead < total and not lines[lookahead].strip():
+                lookahead += 1
+
+            match = None
+            if lookahead < total:
+                match = SECTION_SPLIT_PATTERN.match(lines[lookahead].strip())
+
+            if match:
+                flush()
+                current_label = match.group(1).strip().upper()
+                index = lookahead + 1
+                continue
+
+        buffer.append(line)
+        index += 1
+
+    flush()
+
+    return {
+        label: "\n".join(section_lines)
+        for label, section_lines in sections.items()
+    }
+
+
+def parse_tag_list(value):
+    """TAGS フィールド（カンマ区切り、引用符つき要素あり）を分解する。"""
+    try:
+        row = next(csv.reader([value], skipinitialspace=True))
+    except csv.Error:
+        row = value.split(",")
+
+    return [item.strip() for item in row if item.strip()]
+
+
 def parse_entries(path):
     raw_text = path.read_text(encoding="utf-8-sig", errors="replace")
     text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
@@ -111,7 +222,9 @@ def parse_entries(path):
         if not block.strip():
             continue
 
+        STATS["blocks_total"] += 1
         lines = block.splitlines()
+        preview = next((line.strip() for line in lines if line.strip()), "")[:40]
 
         separator_index = None
         for i, line in enumerate(lines):
@@ -120,6 +233,8 @@ def parse_entries(path):
                 break
 
         if separator_index is None:
+            STATS["blocks_skipped"] += 1
+            warn("  ! ヘッダの区切りがないため、ブロックをスキップしました: " + preview)
             continue
 
         header_lines = lines[:separator_index]
@@ -140,26 +255,15 @@ def parse_entries(path):
             fields.setdefault(key, []).append("\n".join(value_lines).strip())
 
         if "TITLE" not in fields:
+            STATS["blocks_skipped"] += 1
+            warn("  ! TITLE がないため、ブロックをスキップしました: " + preview)
             continue
 
         def first(key, default=""):
             values = fields.get(key)
             return values[0] if values else default
 
-        body_parts = []
-        current_section = []
-
-        for line in remaining_lines:
-            if line.strip() == "-----":
-                body_parts.append("\n".join(current_section))
-                current_section = []
-            else:
-                current_section.append(line)
-
-        body_parts.append("\n".join(current_section))
-
-        body = clean_section(body_parts[0]) if len(body_parts) > 0 else ""
-        extended_body = clean_section(body_parts[1]) if len(body_parts) > 1 else ""
+        sections = split_sections(remaining_lines)
 
         categories = []
         for category in fields.get("CATEGORY", []):
@@ -167,27 +271,41 @@ def parse_entries(path):
             if category and category not in categories:
                 categories.append(category)
 
+        primary_category = first("PRIMARY CATEGORY")
+        if primary_category and primary_category not in categories:
+            categories.insert(0, primary_category)
+
+        for tags_field in fields.get("TAGS", []):
+            for tag in parse_tag_list(tags_field):
+                if tag not in categories:
+                    categories.append(tag)
+
         entries.append(
-            {
-                "title": first("TITLE") or "Untitled",
-                "date": first("DATE"),
-                "status": (first("STATUS") or "publish").lower(),
-                "categories": categories,
-                "basename": first("BASENAME"),
-                "body": body,
-                "extended_body": extended_body,
-            }
+            Entry(
+                title=first("TITLE") or "Untitled",
+                date=first("DATE"),
+                status=(first("STATUS") or "publish").lower(),
+                categories=categories,
+                basename=first("BASENAME"),
+                author=first("AUTHOR"),
+                body=clean_section(sections.get("BODY", "")),
+                extended_body=clean_section(sections.get("EXTENDED BODY", "")),
+                excerpt=clean_section(sections.get("EXCERPT", "")),
+            )
         )
 
     return entries
 
 
-def parse_date(value):
+def parse_date(value, title="", count_failure=True):
     value = str(value).strip()
 
     if not value:
-        STATS["date_failed"] += 1
-        warn("  ! DATE field is empty. Using current date.")
+        if count_failure:
+            STATS["date_failed"] += 1
+            if title:
+                FAILED_DATE_TITLES.append(title)
+        warn("  ! DATE が空のため、現在の日時を使います。")
         return datetime.now(JST)
 
     value = value.replace("\u00a0", " ").strip()
@@ -216,8 +334,11 @@ def parse_date(value):
             pass
 
     if parsed_dt is None:
-        STATS["date_failed"] += 1
-        warn("  ! Could not parse DATE value: " + repr(value) + ". Using current date.")
+        if count_failure:
+            STATS["date_failed"] += 1
+            if title:
+                FAILED_DATE_TITLES.append(title)
+        warn("  ! DATE を読み取れませんでした: " + repr(value) + "。現在の日時を使います。")
         return datetime.now(JST)
 
     if parsed_dt.tzinfo is None:
@@ -280,10 +401,10 @@ def preserve_embeds(soup):
 
 def is_image_link(href):
     parsed = urlparse(href)
-    return (
-        parsed.path.lower().endswith(IMAGE_EXTENSIONS)
-        or "st-hatena.com" in parsed.netloc
-    )
+    if parsed.path.lower().endswith(IMAGE_EXTENSIONS):
+        return True
+    # 拡張子のないフォトライフ画像URL（/images/ 配下）だけを画像として扱う
+    return parsed.netloc.endswith("st-hatena.com") and "/images/" in parsed.path
 
 
 def unwrap_image_links(soup):
@@ -297,8 +418,36 @@ def unwrap_image_links(soup):
             link.unwrap()
 
 
-def clean_hatena_elements(soup):
+def fill_image_alts(soup):
+    """figure の figcaption を、alt が空の img の alt に使う。"""
+    for figure in soup.find_all("figure"):
+        caption = figure.find("figcaption")
+
+        if caption is None:
+            continue
+
+        text = caption.get_text(strip=True)
+        image = figure.find("img")
+
+        if text and image is not None and not (image.get("alt") or "").strip():
+            image["alt"] = text
+
+
+def clean_hatena_elements(soup, remove_toc=True):
     preserve_embeds(soup)
+
+    if remove_toc:
+        for toc in soup.select(".table-of-contents"):
+            toc.decompose()
+
+    # Amazon商品表示は、商品へのリンクだけを残して置き換える
+    for detail in soup.select(".hatena-asin-detail"):
+        link = detail.find("a", href=True)
+
+        if link:
+            detail.replace_with(make_link_paragraph(soup, link["href"]))
+        else:
+            detail.decompose()
 
     for selector in HATENA_SELECTORS:
         for element in soup.select(selector):
@@ -337,14 +486,19 @@ def clean_hatena_elements(soup):
     return soup
 
 
-def html_to_markdown(html, cleanup=True):
+def html_to_markdown(html, cleanup=True, remove_toc=True):
     soup = BeautifulSoup(html, "html.parser")
 
+    fill_image_alts(soup)
+
     if cleanup:
-        soup = clean_hatena_elements(soup)
+        soup = clean_hatena_elements(soup, remove_toc=remove_toc)
     else:
         for element in soup(["script", "style"]):
             element.decompose()
+
+        # --no-cleanup でも埋め込みはリンクとして残す（markdownify が iframe を落とすため）
+        preserve_embeds(soup)
 
     unwrap_image_links(soup)
 
@@ -376,10 +530,37 @@ def candidate_names(stem, suffix, url):
         number += 1
 
 
-def download_image(url, folder, session):
+def sniff_image_suffix(content):
+    """中身の先頭バイトから画像形式を推定する。画像らしくなければ None。"""
+    if content.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+
+    if content.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+
+    if content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return ".webp"
+
+    if content.startswith(b"BM"):
+        return ".bmp"
+
+    if content[4:8] == b"ftyp" and content[8:12] in (b"avif", b"avis"):
+        return ".avif"
+
+    if content.lstrip()[:1] == b"<" and b"<svg" in content[:1024]:
+        return ".svg"
+
+    return None
+
+
+def download_image(url, folder, session, title=""):
     """
     画像を保存してファイル名を返す。失敗時は None。
     同名ファイルが既にあり、内容が同じなら再利用する（再実行しても増殖しない）。
+    HTMLが返ってきた場合は画像ではないので失敗として扱う。
     """
     try:
         if url.startswith("//"):
@@ -388,6 +569,13 @@ def download_image(url, folder, session):
         response = session.get(url, timeout=30)
         response.raise_for_status()
         content = response.content
+
+        content_type = (
+            response.headers.get("content-type", "").split(";")[0].strip().lower()
+        )
+
+        if content_type.startswith("text/html"):
+            raise ValueError("画像ではなく HTML が返ってきました")
 
         parsed_url = urlparse(url)
         original_name = Path(unquote(parsed_url.path)).name
@@ -399,11 +587,18 @@ def download_image(url, folder, session):
         name_path = Path(original_name)
         stem, suffix = name_path.stem, name_path.suffix
 
-        if not suffix:
-            content_type = response.headers.get("content-type", "").split(";")[0].strip()
-            suffix = {"image/jpeg": ".jpg"}.get(content_type) or (
-                mimetypes.guess_extension(content_type) or ".jpg"
-            )
+        # ヘッダが画像を名乗っていても、中身が画像でなければ失敗として扱う
+        sniffed = sniff_image_suffix(content)
+
+        if sniffed is None:
+            raise ValueError("中身が画像ではありませんでした")
+
+        if suffix.lower() not in IMAGE_EXTENSIONS:
+            suffix = sniffed
+        else:
+            normalized = ".jpg" if suffix.lower() == ".jpeg" else suffix.lower()
+            if sniffed != normalized:
+                suffix = sniffed
 
         for name in candidate_names(stem, suffix, url):
             destination = folder / name
@@ -418,11 +613,12 @@ def download_image(url, folder, session):
 
     except Exception as error:
         STATS["image_failed"] += 1
-        warn("  ! Failed to download image: " + url + " (" + str(error) + ")")
+        FAILED_IMAGES.append((title, url))
+        warn("  ! 画像をダウンロードできませんでした: " + url + "（" + str(error) + "）")
         return None
 
 
-def localize_images(markdown, post_dir, session, sleep_seconds):
+def localize_images(markdown, post_dir, session, sleep_seconds, title=""):
     pattern = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
     cache = {}  # 同じ記事内で同じURLを二度ダウンロードしない
 
@@ -436,7 +632,7 @@ def localize_images(markdown, post_dir, session, sleep_seconds):
         if url in cache:
             filename = cache[url]
         else:
-            filename = download_image(url, post_dir, session)
+            filename = download_image(url, post_dir, session, title=title)
             cache[url] = filename
 
             if filename and sleep_seconds:
@@ -464,16 +660,30 @@ def yaml_quote(value):
     return '"' + escape_yaml(value) + '"'
 
 
-def make_frontmatter(entry, date, is_draft):
+def make_frontmatter(
+    entry,
+    date,
+    is_draft,
+    slug="",
+    include_slug=False,
+    include_author=False,
+    author_name="",
+):
     lines = [
         "---",
-        "title: " + yaml_quote(entry["title"]),
-        'description: ""',
+        "title: " + yaml_quote(entry.title),
         "pubDate: " + date.replace(microsecond=0).isoformat(),
     ]
 
-    if entry["categories"]:
-        tags = ", ".join(yaml_quote(category) for category in entry["categories"])
+    if include_slug and slug:
+        lines.append("slug: " + yaml_quote(slug))
+
+    author_value = author_name.strip() or (entry.author.strip() if include_author else "")
+    if author_value:
+        lines.append("author: " + yaml_quote(author_value))
+
+    if entry.categories:
+        tags = ", ".join(yaml_quote(category) for category in entry.categories)
         lines.append("tags: [" + tags + "]")
 
     if is_draft:
@@ -485,60 +695,238 @@ def make_frontmatter(entry, date, is_draft):
 
 
 # ----------------------------------------------------------------------
+# 対話モードと設定の解決
+# ----------------------------------------------------------------------
+
+def clean_path_text(text):
+    """ドラッグ＆ドロップ等で付いた引用符と空白を取り除く。"""
+    text = text.strip()
+
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        text = text[1:-1]
+
+    return text.strip()
+
+
+def ask_text(question, default=""):
+    suffix = " [" + default + "]" if default else ""
+    try:
+        answer = input(question + suffix + ": ")
+    except (EOFError, KeyboardInterrupt):
+        return None
+    return answer.strip() or default
+
+
+def ask_yes_no(question, default=False):
+    hint = "[Y/n]" if default else "[y/N]"
+    prompt = (question + " " if question else "") + hint + ": "
+    while True:
+        try:
+            answer = input(prompt).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not answer:
+            return default
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        print("y か n で答えてください。")
+
+
+def ask_choice(question, options, default_index=0):
+    print(question)
+    for number, label in enumerate(options, 1):
+        marker = "（既定）" if number - 1 == default_index else ""
+        print("  " + str(number) + ". " + label + marker)
+    while True:
+        try:
+            answer = input("番号を入力してください [" + str(default_index + 1) + "]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not answer:
+            return default_index
+        if answer.isdigit() and 1 <= int(answer) <= len(options):
+            return int(answer) - 1
+        print("1 から " + str(len(options)) + " の番号で答えてください。")
+
+
+def prompt_settings():
+    """対話モードで設定を聞く。キャンセル時は None。"""
+    print("hatena-to-astro 対話モード")
+    print("分からないところは、そのまま Enter を押せば既定値が使われます。")
+    print()
+
+    input_path = None
+    while input_path is None:
+        raw = ask_text("エクスポートファイル（.txt）のパス")
+        if raw is None or not raw:
+            return None
+        candidate = Path(clean_path_text(raw)).expanduser()
+        if candidate.is_file():
+            input_path = candidate
+        else:
+            print("ファイルが見つかりません: " + str(candidate))
+            print("もう一度入力してください。")
+
+    output_dir = (Path.cwd() / OUTPUT_DIR_NAME).resolve()
+
+    print()
+    choice = ask_choice(
+        "どの記事を変換しますか。",
+        ["公開記事のみ", "下書きも含める", "下書きのみ"],
+        0,
+    )
+    if choice is None:
+        return None
+
+    print()
+    print("挿入されている目次を引き継ぎますか。")
+    print("見出しから自動生成された目次です。")
+    keep_toc = ask_yes_no("", False)
+    if keep_toc is None:
+        return None
+    remove_toc = not keep_toc
+
+    print()
+    print("記事のURL名を引き継ぎますか。")
+    print("元のURL名を slug としてフロントマターに書きます。")
+    include_slug = ask_yes_no("", False)
+    if include_slug is None:
+        return None
+
+    print()
+    print("著者名を引き継ぎますか。")
+    print("エクスポートの著者名を author としてフロントマターに書きます。")
+    include_author = ask_yes_no("", False)
+    if include_author is None:
+        return None
+
+    author_name = ""
+    if include_author:
+        print()
+        print("author に設定する名前を入力してください。")
+        print("空欄のまま Enter を押すと、エクスポートの著者名をそのまま使います。")
+        author_name = ask_text("名前")
+        if author_name is None:
+            return None
+
+    print()
+    print("入力ファイル: " + str(input_path))
+    print("出力先: " + str(output_dir))
+    print("対象: " + ["公開記事のみ", "下書きも含める", "下書きのみ"][choice])
+    print("目次: " + ("引き継ぐ" if keep_toc else "引き継がない（削除する）"))
+    print("URL名: " + ("フロントマターにも引き継ぐ" if include_slug else "フォルダ名のみ"))
+    if include_author:
+        print("author: " + (author_name if author_name else "エクスポートの著者名を引き継ぐ"))
+    else:
+        print("author: 含めない")
+
+    print()
+    if not ask_yes_no("この内容で変換しますか", True):
+        return None
+
+    return argparse.Namespace(
+        input_path=input_path.resolve(),
+        output_dir=output_dir,
+        include_drafts=choice == 1,
+        drafts_only=choice == 2,
+        sleep=0.2,
+        no_cleanup=False,
+        remove_toc=remove_toc,
+        include_slug=include_slug,
+        include_author=include_author,
+        author_name=author_name,
+        debug_date=False,
+    )
+
+
+def settings_from_args(args):
+    """コマンドライン引数から設定を組み立てる。出力先は converted フォルダ固定。"""
+    return argparse.Namespace(
+        input_path=Path(args.input).expanduser().resolve(),
+        output_dir=(Path.cwd() / OUTPUT_DIR_NAME).resolve(),
+        include_drafts=args.include_drafts,
+        drafts_only=args.drafts_only,
+        sleep=args.sleep,
+        no_cleanup=args.no_cleanup,
+        remove_toc=not args.keep_toc,
+        include_slug=args.set_slug,
+        include_author=args.include_author or bool(args.author),
+        author_name=args.author or "",
+        debug_date=args.debug_date,
+    )
+
+
+# ----------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert Hatena Blog MT export files into Astro Markdown with Asset Colocation."
+        description="はてなブログのエクスポートファイル（MT形式）を Astro 用の Markdown に変換します"
     )
-    parser.add_argument("--input", required=True, help="Hatena Blog export .txt file")
-    parser.add_argument("--astro-dir", default=".", help="Astro project root")
-    parser.add_argument("--posts-dir", default="src/content/blog", help="Directory for Content Collections")
-    parser.add_argument("--include-drafts", action="store_true", help="Also convert drafts (written with draft: true)")
-    parser.add_argument("--drafts-only", action="store_true", help="Convert drafts only (written with draft: true)")
-    parser.add_argument("--sleep", type=float, default=0.2, help="Seconds to wait after each image download")
-    parser.add_argument("--no-cleanup", action="store_true", help="Skip Hatena-specific element cleanup")
+    parser.add_argument("--input", help="はてなブログからエクスポートした .txt ファイル（省略すると対話モードが始まります）")
+    parser.add_argument("--interactive", action="store_true", help="対話モードで起動する")
+    parser.add_argument("--include-drafts", action="store_true", help="下書きも変換する（draft: true を付けて出力）")
+    parser.add_argument("--drafts-only", action="store_true", help="下書きだけを変換する（draft: true を付けて出力）")
+    parser.add_argument("--sleep", type=float, default=0.2, help="画像ダウンロード後の待機時間（秒）")
+    parser.add_argument("--no-cleanup", action="store_true", help="はてな固有の要素の削除を一部無効化する")
+    parser.add_argument("--keep-toc", action="store_true", help="見出しから自動生成された目次を引き継ぐ（既定では削除します）")
+    parser.add_argument("--set-slug", action="store_true", help="slug をフロントマターにも書く")
+    parser.add_argument("--include-author", action="store_true", help="author をフロントマターに書く（各記事の AUTHOR を使用）")
+    parser.add_argument("--author", default=None, metavar="NAME", help="author として指定した名前を全記事に書く（--include-author を兼ねます）")
     parser.add_argument("--debug-date", action="store_true")
     args = parser.parse_args()
 
-    input_path = Path(args.input).expanduser().resolve()
-    astro_dir = Path(args.astro_dir).expanduser().resolve()
-    posts_dir = astro_dir / args.posts_dir
+    if args.interactive or not args.input:
+        settings = prompt_settings()
 
+        if settings is None:
+            print("キャンセルしました。")
+            return 2
+    else:
+        settings = settings_from_args(args)
+
+    if not settings.input_path.is_file():
+        warn("入力ファイルが見つかりません: " + str(settings.input_path))
+        return 2
+
+    posts_dir = settings.output_dir
     posts_dir.mkdir(parents=True, exist_ok=True)
 
-    entries = parse_entries(input_path)
-    print("Found " + str(len(entries)) + " entries.")
+    entries = parse_entries(settings.input_path)
+    print(str(len(entries)) + " 件の記事が見つかりました。")
 
-    if args.debug_date and entries:
-        print("First entry DATE:", repr(entries[0]["date"]))
-        print("Parsed first date:", parse_date(entries[0]["date"]))
-        STATS["date_failed"] = 0
+    if settings.debug_date and entries:
+        print("最初の記事の DATE:", repr(entries[0].date))
+        print("解析した日付:", parse_date(entries[0].date, count_failure=False))
 
     session = requests.Session()
-    session.headers["User-Agent"] = "hatena-to-astro/1.1"
+    session.headers["User-Agent"] = "hatena-to-astro/2.0"
 
     used_slugs = set()
     converted = 0
+    overwrote = 0
+    redirect_rows = []
 
     for index, entry in enumerate(entries, 1):
-        is_draft = entry["status"] != "publish"
+        is_draft = entry.status != "publish"
 
-        if args.drafts_only and not is_draft:
-            print("[" + str(index) + "] Skipped published entry: " + entry["title"])
+        if settings.drafts_only and not is_draft:
+            print("[" + str(index) + "] 公開記事のためスキップしました: " + entry.title)
             continue
 
-        if is_draft and not args.include_drafts and not args.drafts_only:
-            print("[" + str(index) + "] Skipped draft: " + entry["title"])
+        if is_draft and not settings.include_drafts and not settings.drafts_only:
+            print("[" + str(index) + "] 下書きのためスキップしました: " + entry.title)
             continue
 
-        date = parse_date(entry["date"])
+        date = parse_date(entry.date, title=entry.title)
 
         # BASENAME -> タイトル -> 日時 の順でスラッグを決める
         base_slug = (
-            slugify(entry["basename"])
-            or slugify(entry["title"])
+            slugify(entry.basename)
+            or slugify(entry.title)
             or date.strftime("%Y%m%d%H%M%S")
         )
         slug = base_slug
@@ -550,46 +938,113 @@ def main():
 
         used_slugs.add(slug)
 
-        print("[" + str(index) + "] Converting: " + entry["title"])
+        print("[" + str(index) + "] 変換しています: " + entry.title)
 
-        html = entry["body"]
+        try:
+            html = entry.body
 
-        if entry["extended_body"]:
-            html += "\n" + entry["extended_body"]
+            if entry.extended_body:
+                html += "\n" + entry.extended_body
 
-        markdown = html_to_markdown(html, cleanup=not args.no_cleanup)
+            markdown = html_to_markdown(
+                html, cleanup=not settings.no_cleanup, remove_toc=settings.remove_toc
+            )
 
-        # 記事ごとにフォルダを切り（Leaf Bundle）、画像と index.md を同じ場所に置く
-        post_dir = posts_dir / slug
+            # 記事ごとにフォルダを切り（Leaf Bundle）、画像と index.md を同じ場所に置く
+            post_dir = posts_dir / slug
 
-        markdown = localize_images(markdown, post_dir, session, args.sleep)
+            markdown = localize_images(
+                markdown, post_dir, session, settings.sleep, title=entry.title
+            )
 
-        post_dir.mkdir(parents=True, exist_ok=True)
-        output_path = post_dir / "index.md"
+            post_dir.mkdir(parents=True, exist_ok=True)
+            output_path = post_dir / "index.md"
 
-        output_path.write_text(
-            make_frontmatter(entry, date, is_draft) + markdown,
-            encoding="utf-8",
-        )
+            if output_path.exists():
+                overwrote += 1
+
+            output_path.write_text(
+                make_frontmatter(
+                    entry,
+                    date,
+                    is_draft,
+                    slug=slug,
+                    include_slug=settings.include_slug,
+                    include_author=settings.include_author,
+                    author_name=settings.author_name,
+                )
+                + markdown,
+                encoding="utf-8",
+            )
+        except Exception as error:
+            FAILED_ENTRIES.append((entry.title, str(error)))
+            warn(
+                "  ! エラーが発生したため、この記事をスキップしました（"
+                + str(error) + "）"
+            )
+            continue
+
+        if entry.basename:
+            redirect_rows.append([entry.basename, slug, entry.title])
 
         converted += 1
-        print("  -> " + str(output_path.relative_to(astro_dir)))
 
-    print("Done. Converted " + str(converted) + " entries.")
+        try:
+            shown_path = output_path.relative_to(Path.cwd())
+        except ValueError:
+            shown_path = output_path
+
+        print("  -> " + str(shown_path))
+
+    print("完了しました。" + str(converted) + " 件の記事を変換しました。")
+
+    if overwrote:
+        print(str(overwrote) + " 件の既存の記事を上書きしました。")
+
+    if redirect_rows:
+        map_path = posts_dir / "redirect-map.csv"
+        with map_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["basename", "slug", "title"])
+            writer.writerows(redirect_rows)
+        print("リダイレクト対応表を出力しました: " + str(map_path))
+
+    if STATS["blocks_skipped"]:
+        warn(
+            "! 全 " + str(STATS["blocks_total"]) + " ブロックのうち "
+            + str(STATS["blocks_skipped"])
+            + " 件は、記事として認識できなかったためスキップしました。"
+        )
 
     if STATS["date_failed"]:
-        warn("! " + str(STATS["date_failed"]) + " entries had an unreadable DATE (current date was used).")
+        warn("! " + str(STATS["date_failed"]) + " 件の記事で DATE を読み取れなかったため、現在の日時を使いました:")
+        for failed_title in FAILED_DATE_TITLES:
+            warn("    - " + failed_title)
+
+    if FAILED_ENTRIES:
+        warn("! " + str(len(FAILED_ENTRIES)) + " 件の記事でエラーが発生し、変換できませんでした:")
+        for failed_title, reason in FAILED_ENTRIES:
+            warn("    - " + failed_title + "（" + reason + "）")
 
     if STATS["image_failed"]:
-        warn("! " + str(STATS["image_failed"]) + " images failed to download (remote URLs were kept).")
+        warn("! " + str(STATS["image_failed"]) + " 件の画像をダウンロードできませんでした（元の URL のまま残しています）:")
+        for failed_title, failed_url in FAILED_IMAGES:
+            if failed_title:
+                warn("    - " + failed_title + ": " + failed_url)
+            else:
+                warn("    - " + failed_url)
 
     if STATS["foto_removed"]:
         warn(
-            "! " + str(STATS["foto_removed"])
-            + " Hatena Fotolife notations (f:id:...) were removed. "
-            "Those images could not be resolved to a URL; please check the posts."
+            "! はてなフォトライフ記法（f:id:...）を " + str(STATS["foto_removed"])
+            + " 件取り除きました。URL に変換できない画像のため、記事を確認してください。"
         )
+
+    if STATS["date_failed"] or STATS["blocks_skipped"] or FAILED_ENTRIES:
+        return 1
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
